@@ -1,8 +1,10 @@
-"""Role-based Crane agent.
+"""Role-based Crane agent with terrain-aware movement.
 
 Every unit owns one instance of ``Agent``. The units therefore coordinate from the
 allies and enemies they can currently see, rather than through shared Python state.
 """
+
+from heapq import heappop, heappush
 
 from sandbox.crane import action, me, paths, tile, visible
 from sandbox.observation_types import AxialPosition, SkirmishAction, SkirmishObservation
@@ -40,8 +42,10 @@ class Agent:
 
         # Score every complete legal route by its final tile. The minimum matters because an
         # archer is only as safe as its nearest enemy. Once routes are equally safe, the archer
-        # moves closer to its nearest footman, then spends any remaining movement it can.
+        # moves closer to its nearest footman, follows an A* escape route, then spends any
+        # remaining movement it can.
         here = me.position(observation)
+        planned_escape = self._pathfind_path(observation, self._retreat_goal(observation, enemies))
         path_id = max(
             action.legal_paths(observation),
             key=lambda path: (
@@ -53,6 +57,7 @@ class Agent:
                     (tile.distance(tile.at_path_end(here, path), footman["position"]) for footman in footmen),
                     default=0,
                 ),
+                path == planned_escape,
                 len(paths.decode(path)),
                 -path,
             ),
@@ -152,12 +157,119 @@ class Agent:
         merely to walk farther.
         """
         here = me.position(observation)
-        path_id = min(
-            action.legal_paths(observation),
-            key=lambda path: (
-                tile.distance(tile.at_path_end(here, path), goal),
-                -len(paths.decode(path)),
-                path,
-            ),
-        )
+        path_id = self._pathfind_path(observation, goal)
+        if path_id is None:
+            # A hidden unit can block a route that was planned from the visible state. Fall back
+            # to the best currently legal endpoint; the next activation replans from there.
+            path_id = min(
+                action.legal_paths(observation),
+                key=lambda path: (
+                    tile.distance(tile.at_path_end(here, path), goal),
+                    -len(paths.decode(path)),
+                    path,
+                ),
+            )
         return action.move(path_id, target_id, observation) if target_id else action.move(path_id)
+
+    def _retreat_goal(self, observation: SkirmishObservation, enemies: list[dict]) -> AxialPosition:
+        """Return a passable tile that is far from enemies and, on ties, near a footman."""
+        footmen = [ally for ally in visible.allies(observation) if ally["type"] == "footman"]
+        best_goal = me.position(observation)
+        best_score: tuple[int, int] | None = None
+        battlefield = observation["observation"]["battlefield"]
+        for r, row in enumerate(battlefield["tiles"]):
+            for q, ground in enumerate(row):
+                if ground["terrain"] in {"water", "void"}:
+                    continue
+                candidate: AxialPosition = {"q": q, "r": r}
+                score = (
+                    min(tile.distance(candidate, enemy["position"]) for enemy in enemies),
+                    -min((tile.distance(candidate, footman["position"]) for footman in footmen), default=0),
+                )
+                if best_score is None or score > best_score:
+                    best_goal, best_score = candidate, score
+        return best_goal
+
+    def _pathfind_path(self, observation: SkirmishObservation, goal: AxialPosition) -> int | None:
+        """Return the longest legal prefix of an A* route to ``goal``."""
+        route = self._a_star_route(observation, me.position(observation), goal)
+        if route is None:
+            return None
+
+        legal_paths = set(action.legal_paths(observation))
+        for length in range(min(paths.MAX_STEPS, len(route)), 0, -1):
+            path_id = paths.encode(route[:length])
+            if path_id in legal_paths:
+                return path_id
+        return 0
+
+    def _a_star_route(
+        self, observation: SkirmishObservation, start: AxialPosition, goal: AxialPosition
+    ) -> tuple[int, ...] | None:
+        """Plan through known passable tiles using the game's terrain movement costs."""
+        visible_units = [*visible.allies(observation), *visible.enemies(observation)]
+        occupied = {(unit["position"]["q"], unit["position"]["r"]) for unit in visible_units}
+        start_key = (start["q"], start["r"])
+        goal_key = (goal["q"], goal["r"])
+
+        # A visible unit occupies its tile, so reach one of its free neighboring tiles instead.
+        if goal_key in occupied or not self._is_passable(observation, goal):
+            destinations = {
+                (neighbor["q"], neighbor["r"])
+                for neighbor in tile.neighbors(goal).values()
+                if self._is_passable(observation, neighbor)
+                and (neighbor["q"], neighbor["r"]) not in occupied
+            }
+        else:
+            destinations = {goal_key}
+        if not destinations:
+            return None
+
+        def heuristic(position: tuple[int, int]) -> int:
+            current: AxialPosition = {"q": position[0], "r": position[1]}
+            return min(tile.distance(current, {"q": q, "r": r}) for q, r in destinations)
+
+        frontier: list[tuple[int, int, int, tuple[int, int]]] = [(heuristic(start_key), 0, 0, start_key)]
+        costs = {start_key: 0}
+        previous: dict[tuple[int, int], tuple[tuple[int, int], int]] = {}
+        sequence = 0
+
+        while frontier:
+            _, cost_so_far, _, current = heappop(frontier)
+            if cost_so_far != costs.get(current):
+                continue
+            if current in destinations:
+                route: list[int] = []
+                while current != start_key:
+                    current, direction = previous[current]
+                    route.append(direction)
+                return tuple(reversed(route))
+
+            current_position: AxialPosition = {"q": current[0], "r": current[1]}
+            for direction, neighbor in tile.neighbors(current_position).items():
+                neighbor_key = (neighbor["q"], neighbor["r"])
+                if neighbor_key in occupied or not self._is_passable(observation, neighbor):
+                    continue
+                next_cost = cost_so_far + self._terrain_cost(observation, neighbor)
+                if next_cost >= costs.get(neighbor_key, float("inf")):
+                    continue
+                costs[neighbor_key] = next_cost
+                previous[neighbor_key] = (current, direction)
+                sequence += 1
+                heappush(
+                    frontier,
+                    (next_cost + heuristic(neighbor_key), next_cost, sequence, neighbor_key),
+                )
+        return None
+
+    @staticmethod
+    def _is_passable(observation: SkirmishObservation, position: AxialPosition) -> bool:
+        return tile.terrain_at(observation, position)["terrain"] not in {"water", "void"}
+
+    @staticmethod
+    def _terrain_cost(observation: SkirmishObservation, position: AxialPosition) -> int:
+        """Mirror the movement-point cost used by the game for a passable tile."""
+        ground = tile.terrain_at(observation, position)
+        terrain_cost = 2 if ground["terrain"] == "hill" else 1
+        feature_cost = {"forest": 1, "marsh": 2}.get(ground["feature"], 0)
+        return terrain_cost + feature_cost
