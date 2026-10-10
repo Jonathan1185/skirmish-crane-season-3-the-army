@@ -42,3 +42,8 @@ Test the connection with:
 ```console
 python -m sandbox llm
 ```
+##Design Goal: My design goal was to make the archer smarter by helping it try to get away from the enemy and make it go close to the footmen. Additionally I tried making the footmen more focused on protecting the archer.
+
+##Short Reflection: After seeing how to the agent behaves I knew that I also wanted the archer to try and be the smartest out of the three different NPC because it is the lowest health unit. Additionally the footmen also has fewer moves then the calvery so the archer working along side the footmen would seem ideal.
+
+#AI Disclosure and reflection: I used a AI agent (Codex) for my agent to help with the unit behavior and agent navigation.
