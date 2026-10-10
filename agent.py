@@ -6,7 +6,7 @@ allies and enemies they can currently see, rather than through shared Python sta
 
 from heapq import heappop, heappush
 
-from sandbox.crane import action, me, paths, tile, visible
+from sandbox.crane import action, me, paths, tile, units, visible
 from sandbox.observation_types import AxialPosition, SkirmishAction, SkirmishObservation
 
 
@@ -30,40 +30,41 @@ class Agent:
         return self._footman_order(observation)
 
     def _archer_order(self, observation: SkirmishObservation) -> SkirmishAction:
-        """Retreat as far as possible from the closest enemy after the whole walk."""
+        """Search for targets, then kite the closest one at maximum arrow range."""
         enemies = visible.enemies(observation)
         footmen = [ally for ally in visible.allies(observation) if ally["type"] == "footman"]
         if not enemies:
-            if footmen:
-                here = me.position(observation)
-                footman = min(footmen, key=lambda ally: tile.distance(here, ally["position"]))
-                return self._move_toward(observation, footman["position"])
+            # The center gives the archer the best chance to bring its long vision to bear. A
+            # footman heading toward this archer will still meet it there or on the route.
             return self._move_toward(observation, tile.at_center(observation))
 
-        # Score every complete legal route by its final tile. The minimum matters because an
-        # archer is only as safe as its nearest enemy. Once routes are equally safe, the archer
-        # moves closer to its nearest footman, follows an A* escape route, then spends any
-        # remaining movement it can.
         here = me.position(observation)
-        planned_escape = self._pathfind_path(observation, self._retreat_goal(observation, enemies))
+        target = min(enemies, key=lambda enemy: tile.distance(here, enemy["position"]))
+        attack_range = units.STATS["archer"].attack_range
+
+        # Maximize distance from the closest target while keeping it in arrow range: the preferred
+        # endpoint is exactly range 6, where the archer attacks without closing in. A hill can
+        # extend vision beyond attack range, in which case the archer instead paths toward sight.
+        attack_paths = [
+            path
+            for path in action.legal_paths(observation)
+            if tile.distance(tile.at_path_end(here, path), target["position"]) <= attack_range
+        ]
+        if not attack_paths:
+            return self._move_toward(observation, target["position"], target["unit_id"])
         path_id = max(
-            action.legal_paths(observation),
+            attack_paths,
             key=lambda path: (
-                min(
-                    tile.distance(tile.at_path_end(here, path), enemy["position"])
-                    for enemy in enemies
-                ),
+                tile.distance(tile.at_path_end(here, path), target["position"]),
+                min(tile.distance(tile.at_path_end(here, path), enemy["position"]) for enemy in enemies),
                 -min(
                     (tile.distance(tile.at_path_end(here, path), footman["position"]) for footman in footmen),
                     default=0,
                 ),
-                path == planned_escape,
                 len(paths.decode(path)),
                 -path,
             ),
         )
-        landing = tile.at_path_end(here, path_id)
-        target = min(enemies, key=lambda enemy: tile.distance(landing, enemy["position"]))
         return action.move(path_id, target["unit_id"], observation)
 
     def _cavalry_order(self, observation: SkirmishObservation) -> SkirmishAction:
@@ -170,25 +171,6 @@ class Agent:
                 ),
             )
         return action.move(path_id, target_id, observation) if target_id else action.move(path_id)
-
-    def _retreat_goal(self, observation: SkirmishObservation, enemies: list[dict]) -> AxialPosition:
-        """Return a passable tile that is far from enemies and, on ties, near a footman."""
-        footmen = [ally for ally in visible.allies(observation) if ally["type"] == "footman"]
-        best_goal = me.position(observation)
-        best_score: tuple[int, int] | None = None
-        battlefield = observation["observation"]["battlefield"]
-        for r, row in enumerate(battlefield["tiles"]):
-            for q, ground in enumerate(row):
-                if ground["terrain"] in {"water", "void"}:
-                    continue
-                candidate: AxialPosition = {"q": q, "r": r}
-                score = (
-                    min(tile.distance(candidate, enemy["position"]) for enemy in enemies),
-                    -min((tile.distance(candidate, footman["position"]) for footman in footmen), default=0),
-                )
-                if best_score is None or score > best_score:
-                    best_goal, best_score = candidate, score
-        return best_goal
 
     def _pathfind_path(self, observation: SkirmishObservation, goal: AxialPosition) -> int | None:
         """Return the longest legal prefix of an A* route to ``goal``."""
